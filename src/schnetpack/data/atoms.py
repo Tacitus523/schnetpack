@@ -21,6 +21,8 @@ import torch
 import copy
 from ase import Atoms
 from ase.db import connect
+from ase.io import write
+import numpy as np
 
 import schnetpack as spk
 import schnetpack.properties as structure
@@ -35,6 +37,7 @@ __all__ = [
     "resolve_format",
     "create_dataset",
     "load_dataset",
+    "write_dataset",
 ]
 
 
@@ -42,13 +45,17 @@ class AtomsDataFormat(Enum):
     """Enumeration of data formats"""
 
     ASE = "ase"
+    ASE_EXTXYZ = "ase_extxyz"
 
 
 class AtomsDataError(Exception):
     pass
 
 
-extension_map = {AtomsDataFormat.ASE: ".db"}
+extension_map = {
+    AtomsDataFormat.ASE: ".db",
+    AtomsDataFormat.ASE_EXTXYZ: ".extxyz",
+}
 
 
 class BaseAtomsData(ABC):
@@ -488,13 +495,17 @@ class ASEAtomsData(BaseAtomsData):
         if key_value_list is None:
             key_value_list = [{}] * len(property_list)
 
-        for at, prop, key_val in zip(atoms_list, property_list, key_value_list):
-            self._add_system(
-                self.conn,
-                at,
-                key_val,
-                **prop,
-            )
+        with connect(self.datapath, use_lock_file=False) as conn:
+            for idx, (at, prop, key_val) in enumerate(zip(atoms_list, property_list, key_value_list)):
+                self._add_system(
+                    conn,
+                    at,
+                    key_val,
+                    **prop,
+                )
+                
+                if idx+1 % 10000 == 0:
+                    print(f"Added system {idx+1}/{len(property_list)}", flush=True)
 
     def _add_system(
         self,
@@ -600,6 +611,84 @@ def load_dataset(datapath: str, format: AtomsDataFormat, **kwargs) -> BaseAtomsD
         raise AtomsDataError(f"Unknown format: {format}")
     return dataset
 
+def write_dataset(
+    dataset: ASEAtomsData, predictions_dict: Dict[str,List[np.ndarray]], output_path: str, format: Optional[AtomsDataFormat] = AtomsDataFormat.ASE_EXTXYZ
+):
+    """
+    Write dataset to file.
+
+    Args:
+        dataset: atoms dataset
+        datapath: file path
+        format: atoms data format
+
+    """
+
+    if format.value.lower().startswith("ase"):
+        molecules = []
+        property_list = []
+        atom_idx = 0
+        for mol_idx, props in enumerate(dataset.iter_properties(load_structure=True)):
+            props = copy.deepcopy(props)
+            if not structure.Z in props or not structure.position in props:
+                raise AtomsDataError(
+                    "Structure information (Z and position) missing for writing dataset!"
+                )
+            
+            Z = props.pop(structure.Z).numpy()
+            R = props.pop(structure.position).numpy()
+            cell = None
+            pbc = None
+            if structure.cell in props:
+                cell = props.pop(structure.cell).numpy().squeeze()
+            if structure.pbc in props:
+                pbc = props.pop(structure.pbc).numpy()
+            molecule = Atoms(numbers=Z, positions=R, cell=cell, pbc=pbc)
+
+            for prop_name in predictions_dict.keys():
+                prop = props[prop_name]
+                if prop_name.startswith("_"): # skip protected properties
+                    continue
+                prop = prop.numpy().squeeze()
+                if prop.ndim == 0:
+                    molecule.info[f"ref_{prop_name}"] = prop.item()
+                elif prop.shape[0] == len(molecule):
+                    molecule.arrays[f"ref_{prop_name}"] = prop
+                else:
+                    molecule.info[f"ref_{prop_name}"] = prop.tolist()
+
+            for prediction_name, prediction_values in predictions_dict.items():
+                prediction_values = prediction_values.squeeze()
+                if len(prediction_values) == len(dataset):
+                    prediction = prediction_values[mol_idx]
+                    molecule.info[f"pred_{prediction_name}"] = prediction
+                else:
+                    prediction = prediction_values[atom_idx:atom_idx+len(molecule)]
+                    molecule.arrays[f"pred_{prediction_name}"] = prediction
+
+            atom_idx += len(molecule)
+            property_list.append(props)
+            molecules.append(molecule)
+
+    if format is AtomsDataFormat.ASE:
+        if not isinstance(dataset, ASEAtomsData):
+            raise AtomsDataError(
+                "Dataset to be written is not of type ASEAtomsData!"
+            )
+        # create new dataset
+        new_dataset = ASEAtomsData.create(
+            datapath=output_path,
+            distance_unit=dataset.distance_unit,
+            property_unit_dict=dataset.units,
+        )
+        new_dataset.add_systems(
+            property_list=property_list,
+            atoms_list=molecules,
+        )
+    elif format is AtomsDataFormat.ASE_EXTXYZ:
+        write(output_path, molecules)
+    else:
+        raise AtomsDataError(f"Unknown format: {format}")
 
 def resolve_format(
     datapath: str, format: Optional[AtomsDataFormat] = None
@@ -619,6 +708,12 @@ def resolve_format(
             format = AtomsDataFormat.ASE
         assert (
             format is AtomsDataFormat.ASE
+        ), f"File extension {suffix} is not compatible with chosen format {format}"
+    elif suffix == ".extxyz":
+        if format is None:
+            format = AtomsDataFormat.ASE_EXTXYZ
+        assert (
+            format is AtomsDataFormat.ASE_EXTXYZ
         ), f"File extension {suffix} is not compatible with chosen format {format}"
     elif len(suffix) == 0 and format:
         datapath = datapath + extension_map[format]
