@@ -5,6 +5,7 @@ defaults:
 
 datapath: ???
 modeldir: ???
+modelname: best_model
 outputdir: ???
 cutoff: ???
 ckpt_path: null
@@ -12,6 +13,7 @@ batch_size: 100
 write_interval: epoch
 enable_grad: false
 write_idx_m: false
+split_file: null
 
 data:
   _target_: schnetpack.data.ASEAtomsData

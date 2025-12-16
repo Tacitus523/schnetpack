@@ -6,6 +6,8 @@ import socket
 from typing import List
 import random
 import petname
+import numpy as np
+from collections import defaultdict
 
 import torch
 import hydra
@@ -17,7 +19,7 @@ from pytorch_lightning.loggers.logger import Logger
 import schnetpack as spk
 from schnetpack.utils import str2class
 from schnetpack.utils.script import log_hyperparameters, print_config
-from schnetpack.data import BaseAtomsData, AtomsLoader
+from schnetpack.data import BaseAtomsData, AtomsLoader, ASEAtomsData
 from schnetpack.train import PredictionWriter
 from schnetpack import properties
 from schnetpack.utils import load_model
@@ -30,7 +32,7 @@ OmegaConf.register_new_resolver("uuid", lambda x: str(uuid.uuid1()))
 OmegaConf.register_new_resolver("petname", lambda x: petname.generate())
 OmegaConf.register_new_resolver("tmpdir", tempfile.mkdtemp, use_cache=True)
 
-header = """
+header = r"""
    _____      __    _   __     __  ____             __
   / ___/_____/ /_  / | / /__  / /_/ __ \____ ______/ /__
   \__ \/ ___/ __ \/  |/ / _ \/ __/ /_/ / __ `/ ___/ //_/
@@ -174,18 +176,18 @@ def train(config: DictConfig):
 
     # Train the model
     log.info("Starting training.")
-    trainer.fit(model=task, datamodule=datamodule, ckpt_path=config.run.ckpt_path)
+    trainer.fit(model=task, datamodule=datamodule, ckpt_path=config.run.ckpt_path, weights_only=False)
 
     # Evaluate model on test set after training
     log.info("Starting testing.")
-    trainer.test(model=task, datamodule=datamodule, ckpt_path="best")
+    trainer.test(model=task, datamodule=datamodule, ckpt_path="best", weights_only=False)
 
     # Store best model
     best_path = trainer.checkpoint_callback.best_model_path
     log.info(f"Best checkpoint path:\n{best_path}")
 
     log.info(f"Store best model")
-    best_task = type(task).load_from_checkpoint(best_path)
+    best_task = type(task).load_from_checkpoint(best_path, weights_only=False)
     torch.save(best_task, config.globals.model_path + ".task")
 
     best_task.save_model(config.globals.model_path, do_postprocessing=True)
@@ -195,10 +197,23 @@ def train(config: DictConfig):
 @hydra.main(config_path="configs", config_name="predict", version_base="1.2")
 def predict(config: DictConfig):
     log.info(f"Load data from `{config.data.datapath}`")
-    dataset: BaseAtomsData = hydra.utils.instantiate(config.data)
+    dataset: ASEAtomsData = hydra.utils.instantiate(config.data)
+    split_file = config.get("split_file", None)
+    if split_file is not None:
+        if os.path.exists(split_file):
+            log.info(f"Using data split from `{split_file}`")
+            splits = np.load(split_file, allow_pickle=True)
+            test_split = splits.get("test_idx").tolist()
+            if test_split is None:
+                log.error(f"No test split found in `{split_file}`!")
+                raise FileNotFoundError
+            dataset = dataset.subset(test_split)
+        else:
+            log.warning(f"Split file `{split_file}` not found! Using full dataset for prediction.")
+
     loader = AtomsLoader(dataset, batch_size=config.batch_size, num_workers=8)
 
-    model = load_model("best_model")
+    model = load_model(config.modelname)
 
     class WrapperLM(LightningModule):
         def __init__(self, model, enable_grad=config.enable_grad):
@@ -229,8 +244,28 @@ def predict(config: DictConfig):
         default_root_dir=".",
         _convert_="partial",
     )
-    trainer.predict(
+    predictions: List[torch.Tensor] = trainer.predict(
         WrapperLM(model, config.enable_grad),
         dataloaders=loader,
         ckpt_path=config.ckpt_path,
     )
+
+    # collect batches of predictions and restructure
+    concatenated_predictions = defaultdict(list)
+    for batch_prediction in predictions:
+        for property_name, data in batch_prediction.items():
+            if property_name == properties.idx_m:
+                continue
+            concatenated_predictions[property_name].append(data.numpy())
+    concatenated_predictions = {
+        property_name: np.concatenate(data, axis=0)
+        for property_name, data in concatenated_predictions.items()
+    }
+
+    spk.data.atoms.write_dataset(
+        dataset=dataset,
+        predictions_dict=concatenated_predictions,
+        output_path=os.path.join(config.outputdir, "model_geoms.extxyz"),
+        format=spk.data.atoms.AtomsDataFormat.ASE_EXTXYZ,
+    )
+        
